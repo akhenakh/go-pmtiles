@@ -8,6 +8,7 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.3.2
 	github.com/RoaringBitmap/roaring v1.5.0
 	github.com/alecthomas/kong v0.8.0
+	github.com/allegro/bigcache/v3 v3.1.0
 	github.com/aws/aws-sdk-go-v2 v1.30.3
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.58.3
 	github.com/aws/smithy-go v1.20.3
