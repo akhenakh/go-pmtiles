@@ -146,7 +146,6 @@ func main() {
 		}
 
 		pmtiles.SetBuildInfo(version, commit, date)
-		server.Start()
 
 		mux := http.NewServeMux()
 

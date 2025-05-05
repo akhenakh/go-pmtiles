@@ -51,7 +51,6 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 		return err
 	}
 	m.server = server
-	server.Start()
 	return nil
 }
 
