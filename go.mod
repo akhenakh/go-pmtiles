@@ -16,6 +16,7 @@ require (
 	github.com/dustin/go-humanize v1.0.1
 	github.com/paulmach/orb v0.10.0
 	github.com/prometheus/client_golang v1.23.2
+	github.com/phuslu/lru v1.0.18
 	github.com/rs/cors v1.11.1
 	github.com/schollz/progressbar/v3 v3.13.1
 	github.com/stretchr/testify v1.11.1
@@ -130,7 +131,6 @@ require (
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/ncruces/go-strftime v0.1.9 // indirect
 	github.com/onsi/ginkgo/v2 v2.13.2 // indirect
-	github.com/phuslu/lru v1.0.18 // indirect
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
