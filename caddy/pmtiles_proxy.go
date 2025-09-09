@@ -10,9 +10,9 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
-	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/protomaps/go-pmtiles/pmtiles"
+	"github.comcom/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"go.uber.org/zap"
 	_ "gocloud.dev/blob/azureblob"
 	_ "gocloud.dev/blob/fileblob"
@@ -46,7 +46,11 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 	m.logger = ctx.Logger()
 	logger := log.New(io.Discard, "", log.Ldate)
 	prefix := "." // serve only the root of the bucket for now, at the root route of Caddyfile
-	server, err := pmtiles.NewServer(m.Bucket, prefix, logger, m.CacheSize, m.PublicURL)
+
+	// an average directory is 8 KB
+	numItems := m.CacheSize * 1024 * 1024 / 8192
+
+	server, err := pmtiles.NewServer(m.Bucket, prefix, logger, numItems, m.PublicURL)
 	if err != nil {
 		return err
 	}

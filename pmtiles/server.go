@@ -2,11 +2,9 @@ package pmtiles
 
 import (
 	"bytes"
-	"container/list"
 	"context"
 	"encoding/json"
 	"errors"
-	"github.com/rs/cors"
 	"io"
 	"log"
 	"net/http"
@@ -14,6 +12,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/phuslu/lru"
+	"github.com/rs/cors"
 )
 
 type cacheKey struct {
@@ -23,41 +24,23 @@ type cacheKey struct {
 	length uint64 // is 0 for header
 }
 
-type request struct {
-	key         cacheKey
-	value       chan cachedValue
-	purgeEtag   string
-	compression Compression
-}
-
 type cachedValue struct {
 	header    HeaderV3
 	directory []EntryV3
 	etag      string
-	ok        bool
-	badEtag   bool
-}
-
-type response struct {
-	key   cacheKey
-	value cachedValue
-	size  int
-	ok    bool
 }
 
 // Server is an HTTP server for tiles and metadata.
 type Server struct {
-	reqs      chan request
 	bucket    Bucket
 	logger    *log.Logger
-	cacheSize int
 	publicURL string
 	metrics   *metrics
+	cache     *lru.LRUCache[cacheKey, cachedValue]
 }
 
 // NewServer creates a new pmtiles HTTP server.
-func NewServer(bucketURL string, prefix string, logger *log.Logger, cacheSize int, publicURL string) (*Server, error) {
-
+func NewServer(bucketURL string, prefix string, logger *log.Logger, cacheItems int, publicURL string) (*Server, error) {
 	ctx := context.Background()
 
 	bucketURL, _, err := NormalizeBucketKey(bucketURL, prefix, "")
@@ -72,206 +55,131 @@ func NewServer(bucketURL string, prefix string, logger *log.Logger, cacheSize in
 		return nil, err
 	}
 
-	return NewServerWithBucket(bucket, prefix, logger, cacheSize, publicURL)
+	return NewServerWithBucket(bucket, prefix, logger, cacheItems, publicURL)
 }
 
 // NewServerWithBucket creates a new HTTP server for a gocloud Bucket.
-func NewServerWithBucket(bucket Bucket, _ string, logger *log.Logger, cacheSize int, publicURL string) (*Server, error) {
-
-	reqs := make(chan request, 8)
+func NewServerWithBucket(bucket Bucket, _ string, logger *log.Logger, cacheItems int, publicURL string) (*Server, error) {
+	if cacheItems <= 0 {
+		cacheItems = 1024 // A default number of items
+	}
+	cache := lru.NewLRUCache[cacheKey, cachedValue](cacheItems)
 
 	l := &Server{
-		reqs:      reqs,
 		bucket:    bucket,
 		logger:    logger,
-		cacheSize: cacheSize,
 		publicURL: publicURL,
-		metrics:   createMetrics("", logger), // change scope string if there are multiple servers running in one process
+		metrics:   createMetrics("", logger),
+		cache:     cache,
 	}
+	l.metrics.initCacheStats(cacheItems)
 
 	return l, nil
 }
 
 // Start the server HTTP listener.
 func (server *Server) Start() {
+	// This is now a no-op because the cache is self-managing via GetOrLoad.
+}
 
-	go func() {
-		cache := make(map[cacheKey]*list.Element)
-		inflight := make(map[cacheKey][]request)
-		resps := make(chan response, 8)
-		evictList := list.New()
-		totalSize := 0
-		ctx := context.Background()
-		server.metrics.initCacheStats(server.cacheSize * 1000 * 1000)
+// headerLoader fetches and parses the header, and also primes the root directory cache.
+func (server *Server) headerLoader(ctx context.Context, key cacheKey) (cachedValue, error) {
+	var result cachedValue
+	offset := int64(0)
+	length := int64(16384)
 
-		for {
-			select {
-			case req := <-server.reqs:
-				if len(req.purgeEtag) > 0 {
-					if _, dup := inflight[req.key]; !dup {
-						server.metrics.reloadFile(req.key.name)
-						server.logger.Printf("re-fetching directories for changed file %s", req.key.name)
-					}
-					for k, v := range cache {
-						resp := v.Value.(*response)
-						if k.name == req.key.name && (k.etag == req.purgeEtag || resp.value.etag == req.purgeEtag) {
-							evictList.Remove(v)
-							delete(cache, k)
-							totalSize -= resp.size
-						}
-					}
-					server.metrics.updateCacheStats(totalSize, len(cache))
-				}
-				key := req.key
-				isRoot := (key.offset == 0 && key.length == 0)
-				kind := "leaf"
-				if isRoot {
-					kind = "root"
-				}
-				if val, ok := cache[key]; ok {
-					evictList.MoveToFront(val)
-					req.value <- val.Value.(*response).value
-					server.metrics.cacheRequest(key.name, kind, "hit")
-				} else if _, ok := inflight[key]; ok {
-					inflight[key] = append(inflight[key], req)
-					server.metrics.cacheRequest(key.name, kind, "hit") // treat inflight as a hit since it doesn't make a new server request
-				} else {
-					inflight[key] = []request{req}
-					server.metrics.cacheRequest(key.name, kind, "miss")
-					go func() {
-						var result cachedValue
+	status := ""
+	tracker := server.metrics.startBucketRequest(key.name, "root")
+	defer func() { tracker.finish(ctx, status) }()
 
-						offset := int64(key.offset)
-						length := int64(key.length)
+	server.logger.Printf("fetching %s %d-%d", key.name, offset, length)
+	r, etag, statusCode, err := server.bucket.NewRangeReaderEtag(ctx, key.name+".pmtiles", offset, length, key.etag)
+	status = strconv.Itoa(statusCode)
+	if err != nil {
+		server.logger.Printf("failed to fetch %s %d-%d, %v", key.name, offset, length, err)
+		return result, err
+	}
+	defer r.Close()
 
-						if isRoot {
-							offset = 0
-							length = 16384
-						}
+	b, err := io.ReadAll(r)
+	if err != nil {
+		status = "error"
+		server.logger.Printf("failed to read body for %s %d-%d, %v", key.name, offset, length, err)
+		return result, err
+	}
 
-						status := ""
-						tracker := server.metrics.startBucketRequest(key.name, kind)
-						defer func() { tracker.finish(ctx, status) }()
+	header, err := DeserializeHeader(b[0:HeaderV3LenBytes])
+	if err != nil {
+		status = "error"
+		server.logger.Printf("parsing header failed: %v", err)
+		return result, err
+	}
 
-						server.logger.Printf("fetching %s %d-%d", key.name, offset, length)
-						r, etag, statusCode, err := server.bucket.NewRangeReaderEtag(ctx, key.name+".pmtiles", offset, length, key.etag)
-						status = strconv.Itoa(statusCode)
+	// populate the root directory into the cache before returning the header
+	rootEntries := DeserializeEntries(bytes.NewBuffer(b[header.RootOffset:header.RootOffset+header.RootLength]), header.InternalCompression)
+	rootDirectoryValue := cachedValue{directory: rootEntries, etag: etag}
+	rootDirectoryKey := cacheKey{name: key.name, offset: header.RootOffset, length: header.RootLength, etag: etag}
+	server.cache.Set(rootDirectoryKey, rootDirectoryValue)
 
-						if err != nil {
-							ok = false
-							result.badEtag = isRefreshRequiredError(err)
-							resps <- response{key: key, value: result}
-							server.logger.Printf("failed to fetch %s %d-%d, %v", key.name, key.offset, key.length, err)
-							return
-						}
-						defer r.Close()
-						b, err := io.ReadAll(r)
-						if err != nil {
-							ok = false
-							status = "error"
-							resps <- response{key: key, value: result}
-							server.logger.Printf("failed to fetch %s %d-%d, %v", key.name, key.offset, key.length, err)
-							return
-						}
+	result = cachedValue{header: header, etag: etag}
+	return result, nil
+}
 
-						if isRoot {
-							header, err := DeserializeHeader(b[0:HeaderV3LenBytes])
-							if err != nil {
-								status = "error"
-								server.logger.Printf("parsing header failed: %v", err)
-								return
-							}
+func (server *Server) purge(name string) {
+	server.metrics.reloadFile(name)
+	server.logger.Printf("re-fetching directories for changed file %s", name)
 
-							// populate the root first before header
-							rootEntries := DeserializeEntries(bytes.NewBuffer(b[header.RootOffset:header.RootOffset+header.RootLength]), header.InternalCompression)
-							result2 := cachedValue{directory: rootEntries, ok: true, etag: etag}
-
-							rootKey := cacheKey{name: key.name, offset: header.RootOffset, length: header.RootLength}
-							resps <- response{key: rootKey, value: result2, size: 24 * len(rootEntries), ok: true}
-
-							result = cachedValue{header: header, ok: true, etag: etag}
-							resps <- response{key: key, value: result, size: 127, ok: true}
-						} else {
-							directory := DeserializeEntries(bytes.NewBuffer(b), req.compression)
-							result = cachedValue{directory: directory, ok: true, etag: etag}
-							resps <- response{key: key, value: result, size: 24 * len(directory), ok: true}
-						}
-
-						server.logger.Printf("fetched %s %d-%d", key.name, key.offset, length)
-					}()
-				}
-			case resp := <-resps:
-				key := resp.key
-				// check if there are any requests waiting on the key
-				for _, v := range inflight[key] {
-					v.value <- resp.value
-				}
-				delete(inflight, key)
-
-				if resp.ok {
-					totalSize += resp.size
-					ent := &resp
-					entry := evictList.PushFront(ent)
-					cache[key] = entry
-
-					for {
-						if totalSize < server.cacheSize*1000*1000 {
-							break
-						}
-						ent := evictList.Back()
-						if ent != nil {
-							evictList.Remove(ent)
-							kv := ent.Value.(*response)
-							delete(cache, kv.key)
-							totalSize -= kv.size
-						}
-					}
-					server.metrics.updateCacheStats(totalSize, len(cache))
-				}
-			}
+	keys := server.cache.AppendKeys(nil)
+	for _, k := range keys {
+		if k.name == name {
+			server.cache.Delete(k)
 		}
-	}()
+	}
 }
 
 func (server *Server) getHeaderMetadata(ctx context.Context, name string) (bool, HeaderV3, []byte, error) {
-	found, header, metadataBytes, purgeEtag, err := server.getHeaderMetadataAttempt(ctx, name, "")
-	if len(purgeEtag) > 0 {
-		found, header, metadataBytes, _, err = server.getHeaderMetadataAttempt(ctx, name, purgeEtag)
+	found, header, metadataBytes, err := server.getHeaderMetadataAttempt(ctx, name)
+
+	var refreshErr *RefreshRequiredError
+	if errors.As(err, &refreshErr) {
+		server.purge(name)
+		found, header, metadataBytes, err = server.getHeaderMetadataAttempt(ctx, name)
 	}
 	return found, header, metadataBytes, err
 }
 
-func (server *Server) getHeaderMetadataAttempt(ctx context.Context, name, purgeEtag string) (bool, HeaderV3, []byte, string, error) {
-	rootReq := request{key: cacheKey{name: name, offset: 0, length: 0}, value: make(chan cachedValue, 1), purgeEtag: purgeEtag, compression: UnknownCompression}
-	server.reqs <- rootReq
-	rootValue := <-rootReq.value
-	header := rootValue.header
-
-	if !rootValue.ok {
-		return false, HeaderV3{}, nil, "", nil
+func (server *Server) getHeaderMetadataAttempt(ctx context.Context, name string) (bool, HeaderV3, []byte, error) {
+	rootKey := cacheKey{name: name, offset: 0, length: 0}
+	if _, ok := server.cache.Peek(rootKey); ok {
+		server.metrics.cacheRequest(name, "root", "hit")
+	} else {
+		server.metrics.cacheRequest(name, "root", "miss")
 	}
+
+	rootValue, err, _ := server.cache.GetOrLoad(ctx, rootKey, server.headerLoader)
+	if err != nil {
+		return false, HeaderV3{}, nil, err
+	}
+	header := rootValue.header
 
 	status := ""
 	tracker := server.metrics.startBucketRequest(name, "metadata")
 	defer func() { tracker.finish(ctx, status) }()
 	r, _, statusCode, err := server.bucket.NewRangeReaderEtag(ctx, name+".pmtiles", int64(header.MetadataOffset), int64(header.MetadataLength), rootValue.etag)
 	status = strconv.Itoa(statusCode)
-	if isRefreshRequiredError(err) {
-		return false, HeaderV3{}, nil, rootValue.etag, nil
-	}
+
 	if err != nil {
-		return false, HeaderV3{}, nil, "", nil
+		return false, HeaderV3{}, nil, err
 	}
 	defer r.Close()
 
 	metadataBytes, err := DeserializeMetadataBytes(r, header.InternalCompression)
-
 	if err != nil {
 		status = "error"
-		return true, HeaderV3{}, nil, "", errors.New("unknown compression")
+		return true, HeaderV3{}, nil, errors.New("unknown compression")
 	}
 
-	return true, header, metadataBytes, "", nil
+	return true, header, metadataBytes, nil
 }
 
 func (server *Server) getTileJSON(ctx context.Context, httpHeaders map[string]string, name string) (int, map[string]string, []byte) {
@@ -319,63 +227,96 @@ func (server *Server) getMetadata(ctx context.Context, httpHeaders map[string]st
 	return 200, httpHeaders, metadataBytes
 }
 func (server *Server) getTile(ctx context.Context, httpHeaders map[string]string, name string, z uint8, x uint32, y uint32, ext string) (int, map[string]string, []byte) {
-	status, headers, data, purgeEtag := server.getTileAttempt(ctx, httpHeaders, name, z, x, y, ext, "")
-	if len(purgeEtag) > 0 {
-		// file has new etag, retry once force-purging the etag that is no longer value
-		status, headers, data, _ = server.getTileAttempt(ctx, httpHeaders, name, z, x, y, ext, purgeEtag)
+	status, headers, data, err := server.getTileAttempt(ctx, httpHeaders, name, z, x, y, ext)
+	var refreshErr *RefreshRequiredError
+	if errors.As(err, &refreshErr) {
+		server.purge(name)
+		status, headers, data, _ = server.getTileAttempt(ctx, httpHeaders, name, z, x, y, ext)
 	}
 	return status, headers, data
 }
 
-func (server *Server) getTileAttempt(ctx context.Context, httpHeaders map[string]string, name string, z uint8, x uint32, y uint32, ext string, purgeEtag string) (int, map[string]string, []byte, string) {
-	rootReq := request{key: cacheKey{name: name, offset: 0, length: 0}, value: make(chan cachedValue, 1), purgeEtag: purgeEtag, compression: UnknownCompression}
-	server.reqs <- rootReq
-
-	// https://golang.org/doc/faq#atomic_maps
-	rootValue := <-rootReq.value
-	header := rootValue.header
-
-	if !rootValue.ok {
-		return 404, httpHeaders, []byte("Archive not found"), ""
+func (server *Server) getTileAttempt(ctx context.Context, httpHeaders map[string]string, name string, z uint8, x uint32, y uint32, ext string) (int, map[string]string, []byte, error) {
+	rootKey := cacheKey{name: name, offset: 0, length: 0}
+	if _, ok := server.cache.Peek(rootKey); ok {
+		server.metrics.cacheRequest(name, "root", "hit")
+	} else {
+		server.metrics.cacheRequest(name, "root", "miss")
 	}
+	rootValue, err, _ := server.cache.GetOrLoad(ctx, rootKey, server.headerLoader)
+	if err != nil {
+		return 404, httpHeaders, []byte("Archive not found"), err
+	}
+	header := rootValue.header
+	etag := rootValue.etag
 
 	if z < header.MinZoom || z > header.MaxZoom {
-		return 404, httpHeaders, []byte("Tile not found"), ""
+		return 404, httpHeaders, []byte("Tile not found"), nil
 	}
 
 	switch header.TileType {
 	case Mvt:
 		if ext != "mvt" {
-			return 400, httpHeaders, []byte("path mismatch: archive is type MVT (.mvt)"), ""
+			return 400, httpHeaders, []byte("path mismatch: archive is type MVT (.mvt)"), nil
 		}
 	case Png:
 		if ext != "png" {
-			return 400, httpHeaders, []byte("path mismatch: archive is type PNG (.png)"), ""
+			return 400, httpHeaders, []byte("path mismatch: archive is type PNG (.png)"), nil
 		}
 	case Jpeg:
 		if ext != "jpg" {
-			return 400, httpHeaders, []byte("path mismatch: archive is type JPEG (.jpg)"), ""
+			return 400, httpHeaders, []byte("path mismatch: archive is type JPEG (.jpg)"), nil
 		}
 	case Webp:
 		if ext != "webp" {
-			return 400, httpHeaders, []byte("path mismatch: archive is type WebP (.webp)"), ""
+			return 400, httpHeaders, []byte("path mismatch: archive is type WebP (.webp)"), nil
 		}
 	case Avif:
 		if ext != "avif" {
-			return 400, httpHeaders, []byte("path mismatch: archive is type AVIF (.avif)"), ""
+			return 400, httpHeaders, []byte("path mismatch: archive is type AVIF (.avif)"), nil
 		}
 	}
 
 	tileID := ZxyToID(z, x, y)
 	dirOffset, dirLen := header.RootOffset, header.RootLength
 
-	for depth := 0; depth <= 3; depth++ {
-		dirReq := request{key: cacheKey{name: name, offset: dirOffset, length: dirLen, etag: rootValue.etag}, value: make(chan cachedValue, 1), compression: header.InternalCompression}
-		server.reqs <- dirReq
-		dirValue := <-dirReq.value
-		if dirValue.badEtag {
-			return 500, httpHeaders, []byte("I/O Error"), rootValue.etag
+	directoryLoader := func(ctx context.Context, key cacheKey) (cachedValue, error) {
+		var result cachedValue
+		status := ""
+		tracker := server.metrics.startBucketRequest(key.name, "leaf")
+		defer func() { tracker.finish(ctx, status) }()
+
+		r, _, statusCode, err := server.bucket.NewRangeReaderEtag(ctx, key.name+".pmtiles", int64(key.offset), int64(key.length), key.etag)
+		status = strconv.Itoa(statusCode)
+		if err != nil {
+			return result, err
 		}
+		defer r.Close()
+
+		b, err := io.ReadAll(r)
+		if err != nil {
+			status = "error"
+			return result, err
+		}
+
+		directory := DeserializeEntries(bytes.NewBuffer(b), header.InternalCompression)
+		result = cachedValue{directory: directory, etag: key.etag}
+		return result, nil
+	}
+
+	for depth := 0; depth <= 3; depth++ {
+		dirKey := cacheKey{name: name, offset: dirOffset, length: dirLen, etag: etag}
+		if _, ok := server.cache.Peek(dirKey); ok {
+			server.metrics.cacheRequest(name, "leaf", "hit")
+		} else {
+			server.metrics.cacheRequest(name, "leaf", "miss")
+		}
+
+		dirValue, err, _ := server.cache.GetOrLoad(ctx, dirKey, directoryLoader)
+		if err != nil {
+			return 500, httpHeaders, []byte("I/O Error"), err
+		}
+
 		directory := dirValue.directory
 		entry, ok := FindTile(directory, tileID)
 		if !ok {
@@ -386,27 +327,23 @@ func (server *Server) getTileAttempt(ctx context.Context, httpHeaders map[string
 			status := ""
 			tracker := server.metrics.startBucketRequest(name, "tile")
 			defer func() { tracker.finish(ctx, status) }()
-			r, _, statusCode, err := server.bucket.NewRangeReaderEtag(ctx, name+".pmtiles", int64(header.TileDataOffset+entry.Offset), int64(entry.Length), rootValue.etag)
+			r, _, statusCode, err := server.bucket.NewRangeReaderEtag(ctx, name+".pmtiles", int64(header.TileDataOffset+entry.Offset), int64(entry.Length), etag)
 			status = strconv.Itoa(statusCode)
-			if isRefreshRequiredError(err) {
-				return 500, httpHeaders, []byte("I/O Error"), rootValue.etag
-			}
-			// possible we have the header/directory cached but the archive has disappeared
 			if err != nil {
 				if isCanceled(ctx) {
-					return 499, httpHeaders, []byte("Canceled"), ""
+					return 499, httpHeaders, []byte("Canceled"), err
 				}
 				server.logger.Printf("failed to fetch tile %s %d-%d %v", name, entry.Offset, entry.Length, err)
-				return 404, httpHeaders, []byte("Tile not found"), ""
+				return 404, httpHeaders, []byte("Tile not found"), err
 			}
 			defer r.Close()
 			b, err := io.ReadAll(r)
 			if err != nil {
 				status = "error"
 				if isCanceled(ctx) {
-					return 499, httpHeaders, []byte("Canceled"), ""
+					return 499, httpHeaders, []byte("Canceled"), nil
 				}
-				return 500, httpHeaders, []byte("I/O error"), ""
+				return 500, httpHeaders, []byte("I/O error"), nil
 			}
 
 			httpHeaders["ETag"] = generateEtag(b)
@@ -416,17 +353,17 @@ func (server *Server) getTileAttempt(ctx context.Context, httpHeaders map[string
 			if headerVal, ok := compressionToString(header.TileCompression); ok {
 				httpHeaders["Content-Encoding"] = headerVal
 			}
-			return 200, httpHeaders, b, ""
+			return 200, httpHeaders, b, nil
 		}
 		dirOffset = header.LeafDirectoryOffset + entry.Offset
 		dirLen = uint64(entry.Length)
 	}
-	return 204, httpHeaders, nil, ""
+	return 204, httpHeaders, nil, nil
 }
 
 func isRefreshRequiredError(err error) bool {
-	_, ok := err.(*RefreshRequiredError)
-	return ok
+	var refreshErr *RefreshRequiredError
+	return errors.As(err, &refreshErr)
 }
 
 func isCanceled(ctx context.Context) bool {
@@ -484,7 +421,7 @@ func (server *Server) get(ctx context.Context, unsanitizedPath string) (archive,
 	} else {
 		handler, status, data = "404", 404, []byte("Path not found")
 	}
-
+	server.metrics.updateCacheStats(server.cache.Len())
 	return
 }
 

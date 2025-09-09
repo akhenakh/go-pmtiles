@@ -49,8 +49,8 @@ type metrics struct {
 	requestDuration *prometheus.HistogramVec
 	// dir cache: # requests, hits, cache entries, cache bytes, cache bytes limit
 	dirCacheEntries    prometheus.Gauge
-	dirCacheSizeBytes  prometheus.Gauge
-	dirCacheLimitBytes prometheus.Gauge
+	dirCacheSizeItems  prometheus.Gauge
+	dirCacheLimitItems prometheus.Gauge
 	dirCacheRequests   *prometheus.CounterVec
 	// requests to bucket: # total, response duration by archive/status code
 	bucketRequests        *prometheus.CounterVec
@@ -123,14 +123,14 @@ func (m *metrics) reloadFile(name string) {
 	m.reloads.WithLabelValues(name).Inc()
 }
 
-func (m *metrics) initCacheStats(limitBytes int) {
-	m.dirCacheLimitBytes.Set(float64(limitBytes))
-	m.updateCacheStats(0, 0)
+func (m *metrics) initCacheStats(limitItems int) {
+	m.dirCacheLimitItems.Set(float64(limitItems))
+	m.updateCacheStats(0)
 }
 
-func (m *metrics) updateCacheStats(sizeBytes, entries int) {
+func (m *metrics) updateCacheStats(entries int) {
 	m.dirCacheEntries.Set(float64(entries))
-	m.dirCacheSizeBytes.Set(float64(sizeBytes))
+	m.dirCacheSizeItems.Set(float64(entries))
 }
 
 func (m *metrics) cacheRequest(archive, kind, status string) {
@@ -181,17 +181,17 @@ func createMetrics(scope string, logger *log.Logger) *metrics {
 			Name:      "dir_cache_entries",
 			Help:      "Number of directories in the cache",
 		})),
-		dirCacheSizeBytes: register(logger, prometheus.NewGauge(prometheus.GaugeOpts{
+		dirCacheSizeItems: register(logger, prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: scope,
-			Name:      "dir_cache_size_bytes",
-			Help:      "Current directory cache usage in bytes",
+			Name:      "dir_cache_size_items",
+			Help:      "Current directory cache usage in items",
 		})),
-		dirCacheLimitBytes: register(logger, prometheus.NewGauge(prometheus.GaugeOpts{
+		dirCacheLimitItems: register(logger, prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: scope,
-			Name:      "dir_cache_limit_bytes",
-			Help:      "Maximum directory cache size limit in bytes",
+			Name:      "dir_cache_limit_items",
+			Help:      "Maximum directory cache size limit in items",
 		})),
 		dirCacheRequests: register(logger, prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
