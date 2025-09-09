@@ -267,9 +267,13 @@ func TestGetProviderErrorStatusCode(t *testing.T) {
 	statusCode = getProviderErrorStatusCode(gcpErr)
 	assert.Equal(t, 500, statusCode)
 
-	err := errors.New("generic error")
+	err := os.ErrNotExist
 	statusCode = getProviderErrorStatusCode(err)
 	assert.Equal(t, 404, statusCode)
+
+	err = errors.New("generic error")
+	statusCode = getProviderErrorStatusCode(err)
+	assert.Equal(t, 500, statusCode)
 }
 
 func TestGenerationEtag(t *testing.T) {

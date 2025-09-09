@@ -137,18 +137,17 @@ func (server *Server) purge(name string) {
 	}
 }
 
-func (server *Server) getHeaderMetadata(ctx context.Context, name string) (bool, HeaderV3, []byte, error) {
-	found, header, metadataBytes, err := server.getHeaderMetadataAttempt(ctx, name)
-
+func (server *Server) getHeaderMetadata(ctx context.Context, name string) (HeaderV3, []byte, error) {
+	header, metadataBytes, err := server.getHeaderMetadataAttempt(ctx, name)
 	var refreshErr *RefreshRequiredError
 	if errors.As(err, &refreshErr) {
 		server.purge(name)
-		found, header, metadataBytes, err = server.getHeaderMetadataAttempt(ctx, name)
+		header, metadataBytes, err = server.getHeaderMetadataAttempt(ctx, name)
 	}
-	return found, header, metadataBytes, err
+	return header, metadataBytes, err
 }
 
-func (server *Server) getHeaderMetadataAttempt(ctx context.Context, name string) (bool, HeaderV3, []byte, error) {
+func (server *Server) getHeaderMetadataAttempt(ctx context.Context, name string) (HeaderV3, []byte, error) {
 	rootKey := cacheKey{name: name, offset: 0, length: 0}
 	if _, ok := server.cache.Peek(rootKey); ok {
 		server.metrics.cacheRequest(name, "root", "hit")
@@ -158,7 +157,7 @@ func (server *Server) getHeaderMetadataAttempt(ctx context.Context, name string)
 
 	rootValue, err, _ := server.cache.GetOrLoad(ctx, rootKey, server.headerLoader)
 	if err != nil {
-		return false, HeaderV3{}, nil, err
+		return HeaderV3{}, nil, err
 	}
 	header := rootValue.header
 
@@ -169,28 +168,27 @@ func (server *Server) getHeaderMetadataAttempt(ctx context.Context, name string)
 	status = strconv.Itoa(statusCode)
 
 	if err != nil {
-		return false, HeaderV3{}, nil, err
+		return HeaderV3{}, nil, err
 	}
 	defer r.Close()
 
 	metadataBytes, err := DeserializeMetadataBytes(r, header.InternalCompression)
 	if err != nil {
 		status = "error"
-		return true, HeaderV3{}, nil, errors.New("unknown compression")
+		return HeaderV3{}, nil, errors.New("unknown compression")
 	}
 
-	return true, header, metadataBytes, nil
+	return header, metadataBytes, nil
 }
 
 func (server *Server) getTileJSON(ctx context.Context, httpHeaders map[string]string, name string) (int, map[string]string, []byte) {
-	found, header, metadataBytes, err := server.getHeaderMetadata(ctx, name)
+	header, metadataBytes, err := server.getHeaderMetadata(ctx, name)
 
 	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return 404, httpHeaders, []byte("Archive not found")
+		}
 		return 500, httpHeaders, []byte("I/O Error")
-	}
-
-	if !found {
-		return 404, httpHeaders, []byte("Archive not found")
 	}
 
 	var metadataMap map[string]interface{}
@@ -212,14 +210,13 @@ func (server *Server) getTileJSON(ctx context.Context, httpHeaders map[string]st
 }
 
 func (server *Server) getMetadata(ctx context.Context, httpHeaders map[string]string, name string) (int, map[string]string, []byte) {
-	found, _, metadataBytes, err := server.getHeaderMetadata(ctx, name)
+	_, metadataBytes, err := server.getHeaderMetadata(ctx, name)
 
 	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return 404, httpHeaders, []byte("Archive not found")
+		}
 		return 500, httpHeaders, []byte("I/O Error")
-	}
-
-	if !found {
-		return 404, httpHeaders, []byte("Archive not found")
 	}
 
 	httpHeaders["Content-Type"] = "application/json"

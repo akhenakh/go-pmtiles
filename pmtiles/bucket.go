@@ -28,6 +28,9 @@ import (
 	"google.golang.org/api/googleapi"
 )
 
+// ErrNotFound is returned when an archive is not found in the bucket.
+var ErrNotFound = errors.New("not found")
+
 // Bucket is an abstration over a gocloud or plain HTTP bucket.
 type Bucket interface {
 	Close() error
@@ -60,12 +63,12 @@ func (m mockBucket) NewRangeReader(ctx context.Context, key string, offset int64
 func (m mockBucket) NewRangeReaderEtag(_ context.Context, key string, offset int64, length int64, etag string) (io.ReadCloser, string, int, error) {
 	bs, ok := m.items[key]
 	if !ok {
-		return nil, "", 404, fmt.Errorf("Not found %s", key)
+		return nil, "", 404, fmt.Errorf("%w: %s", ErrNotFound, key)
 	}
 
 	resultEtag := generateEtag(bs)
 	if len(etag) > 0 && resultEtag != etag {
-		return nil, "", 412, &RefreshRequiredError{}
+		return nil, "", 412, &RefreshRequiredError{412}
 	}
 	if offset >= int64(len(bs)) {
 		return nil, "", 416, &RefreshRequiredError{416}
@@ -263,7 +266,10 @@ func getProviderErrorStatusCode(err error) int {
 	} else if errors.As(err, &gcpErr); gcpErr != nil {
 		return gcpErr.Code
 	}
-	return 404
+	if os.IsNotExist(err) {
+		return 404
+	}
+	return 500
 }
 
 func getProviderEtag(reader *blob.Reader) string {
@@ -296,6 +302,9 @@ func (ba BucketAdapter) NewRangeReaderEtag(ctx context.Context, key string, offs
 		status = getProviderErrorStatusCode(err)
 		if isRefreshRequiredCode(status) {
 			return nil, "", status, &RefreshRequiredError{status}
+		}
+		if status == 404 || status == 403 {
+			return nil, "", status, fmt.Errorf("%w: %w", ErrNotFound, err)
 		}
 
 		return nil, "", status, err
